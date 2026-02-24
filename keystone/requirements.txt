@@ -1,0 +1,7 @@
+discord.py==2.3.2
+python-dotenv==1.0.1
+google-api-python-client==2.125.0
+google-auth==2.29.0
+google-auth-oauthlib==1.2.0
+aiohttp==3.9.5
+supabase
