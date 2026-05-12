@@ -15,39 +15,114 @@ try:
 except Exception:
     create_client = None  # type: ignore
 
+# Scheduled jobs
+from services.job_runner import JobRunner
+from services.jobs_tax import run_tax_job
+from services.jobs_stipend import run_stipend_job
+
 
 # ── Env ────────────────────────────────────────────────────────────────────────
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
 # Rail-Bound (home guild). Default to old Skyfall ID if env not set (update this!)
-GUILD_ID = int(os.getenv("GUILD_ID", "1374730886234374235"))
+GUILD_ID = int(os.getenv("GUILD_ID", "1374730886234374235") or "0")
 
-# Supabase env (optional for now)
+# Supabase env (optional)
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
-# Bootstrap sync on boot (guild-only). Default ON.
-SYNC_ON_BOOT = (os.getenv("SYNC_ON_BOOT", "true").strip().lower() in ("1", "true", "yes", "y"))
+# IMPORTANT:
+# Do NOT sync on every boot by default. Discord has daily command-create limits,
+# and clearing/recreating commands can burn through that limit very fast.
+#
+# Normal development:
+#   SYNC_ON_BOOT=false
+#
+# When you intentionally changed slash command names/options:
+#   1) Set SYNC_ON_BOOT=true
+#   2) Start the bot once and confirm sync succeeds
+#   3) Set SYNC_ON_BOOT=false again
+#
+# You can also use the prefix command:
+#   !sync_commands
+SYNC_ON_BOOT = os.getenv("SYNC_ON_BOOT", "false").strip().lower() in ("1", "true", "yes", "y")
+KEYSTONE_MODE = os.getenv("KEYSTONE_MODE", "true").strip().lower() in ("1", "true", "yes", "y")
 
-# Keystone mode: load only curated cogs (default ON)
-KEYSTONE_MODE = (os.getenv("KEYSTONE_MODE", "true").strip().lower() in ("1", "true", "yes", "y"))
+DEFAULT_STAFF_ROLE_IDS = {1462497965775257827, 1462498058242625749}
 
-# Keystone v1 cog allowlist
+
+def _parse_staff_role_ids() -> set[int]:
+    raw = (os.getenv("STAFF_ROLE_IDS") or "").strip()
+    if not raw:
+        return set(DEFAULT_STAFF_ROLE_IDS)
+
+    out: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if part.isdigit():
+            out.add(int(part))
+
+    return out or set(DEFAULT_STAFF_ROLE_IDS)
+
+
+def _parse_dev_ids() -> set[int]:
+    raw = (os.getenv("DEV_USER_IDS") or "").strip()
+    if not raw:
+        return set()
+
+    out: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if part.isdigit():
+            out.add(int(part))
+    return out
+
+
+def _is_daily_command_create_limit(error: Exception) -> bool:
+    """
+    Discord error 30034:
+    Max number of daily application command creates has been reached.
+    """
+    return isinstance(error, discord.HTTPException) and getattr(error, "code", None) == 30034
+
+
 KEYSTONE_EXTENSIONS = [
-    "cogs.admin",   # /sync /reload dev tools
-    "cogs.ping",    # /ping sanity check
-    "cogs.oc",      # ✅ new OC group: /oc create|list|select
-    "cogs.items",   # item definitions / basic inventory foundation (swap if needed)
-    "cogs.ledger",  # logging hooks (swap if needed)
+    "cogs.admin",
+    "cogs.ping",
+    "cogs.oc",
+    "cogs.ledger",
+    "cogs.wallet",
+    "cogs.wallet_admin",
+    "cogs.currency_admin",
+    "cogs.tax",
+    "cogs.jobs",
+    "cogs.stipend",
+    "cogs.leaderboard",
+    "cogs.casino",
+    "cogs.backup",
+    "cogs.inventory",
+    "cogs.items",
+    "cogs.stats",
+    "cogs.traits",
+    "cogs.checks",
+    "cogs.xp",
+    "cogs.dice",
+    "cogs.travel",
+    "cogs.rp_tracker",
+    "cogs.commerce",
+    "cogs.postwindow",
+    "cogs.giveaway",
+    "cogs.help",
+
+
 ]
 
 
-# ── Bot class ──────────────────────────────────────────────────────────────────
 class KeystoneBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
-        intents.message_content = True   # keep for now (can turn off later)
+        intents.message_content = True
         intents.members = True
         intents.guilds = True
 
@@ -56,41 +131,148 @@ class KeystoneBot(commands.Bot):
             intents=intents,
             help_command=None,
         )
+
         self.start_time = datetime.now(timezone.utc)
         self.guild_id: int | None = GUILD_ID if GUILD_ID else None
+        self.staff_role_ids: set[int] = _parse_staff_role_ids()
+        self.dev_user_ids: set[int] = _parse_dev_ids()
+        self.job_runner: JobRunner | None = None
 
     async def setup_hook(self):
-        """
-        Initialize Keystone: load cogs, then (optionally) do a guild-only bootstrap sync.
-
-        Notes:
-        - In KEYSTONE_MODE, we only load a curated set of cogs so we don't carry Tangerine scope.
-        - I can flip KEYSTONE_MODE=false in .env if I ever need to load everything.
-        """
         print("\n🧱 Initializing Keystone...")
+        print(f"👷 Staff role IDs: {sorted(self.staff_role_ids)}")
+        print(f"🛠️ Dev user IDs: {sorted(self.dev_user_ids)}")
+
         await self.load_extensions()
 
-        # BOOTSTRAP GUILD SYNC (safe — not global)
-        if SYNC_ON_BOOT and self.guild_id:
-            try:
-                guild_obj = discord.Object(id=self.guild_id)
+        if SYNC_ON_BOOT:
+            await self.safe_sync_application_commands(source="bootstrap")
+        else:
+            print("⏭️ [bootstrap] Slash command sync skipped.")
+            print("   Set SYNC_ON_BOOT=true once, or run !sync_commands, only when command names/options changed.")
 
-                print(f"📌 [bootstrap] Copying global commands to guild {self.guild_id}...")
-                self.tree.copy_global_to(guild=guild_obj)
-
-                print(f"🔁 [bootstrap] Starting guild sync for guild {self.guild_id}...")
-                synced = await self.tree.sync(guild=guild_obj)
-
-                print(f"✅ [bootstrap] Finished guild sync for guild {self.guild_id}: {len(synced)} commands")
-                print(f"📋 [bootstrap] Guild commands: {[c.name for c in synced]}")
-            except Exception as e:
-                print(f"❌ [bootstrap] Guild sync failed: {e!r}")
-                traceback.print_exc()
+        await self.start_job_runner()
 
         print("✅ Keystone initialization complete")
 
+    async def safe_sync_application_commands(self, *, source: str = "manual") -> list[app_commands.AppCommand]:
+        """
+        Safe guild command sync.
+
+        This intentionally does NOT clear guild commands first.
+
+        Old behavior:
+            clear guild commands -> sync empty -> copy global commands -> sync full set
+
+        That burns Discord's daily command-create budget because every boot can recreate
+        the full command set.
+
+        New behavior:
+            copy current in-memory commands to the home guild -> sync once
+
+        This updates existing commands and creates only genuinely new ones.
+        """
+        if not self.guild_id:
+            print(f"⚠️ [{source}] Cannot sync: GUILD_ID is not configured.")
+            return []
+
+        guild_obj = discord.Object(id=self.guild_id)
+
+        print(f"📌 [{source}] Copying current app commands to guild {self.guild_id}...")
+        self.tree.copy_global_to(guild=guild_obj)
+
+        print(f"🔁 [{source}] Syncing guild commands safely for guild {self.guild_id}...")
+        try:
+            synced = await self.tree.sync(guild=guild_obj)
+            print(f"✅ [{source}] Synced {len(synced)} guild commands.")
+            print(f"📋 [{source}] Guild commands: {[c.name for c in synced]}")
+            return synced
+
+        except Exception as e:
+            if _is_daily_command_create_limit(e):
+                print("🚫 Discord command-create limit reached for today.")
+                print("   Your bot is online, but slash command changes cannot sync until Discord's daily limit resets.")
+                print("   Keep SYNC_ON_BOOT=false so the bot does not keep retrying every restart.")
+                print(f"   Raw error: {e!r}")
+                return []
+
+            print(f"❌ [{source}] Guild sync failed: {e!r}")
+            traceback.print_exc()
+            return []
+
+    def can_run_dev_command(self, member: discord.abc.User | discord.Member) -> bool:
+        uid = int(member.id)
+
+        if uid in self.dev_user_ids:
+            return True
+
+        if isinstance(member, discord.Member):
+            if member.guild_permissions.administrator:
+                return True
+            return any(role.id in self.staff_role_ids for role in member.roles)
+
+        return False
+
+    async def start_job_runner(self):
+        try:
+            if getattr(self, "supabase", None) is None:
+                print("⚠️ JobRunner not started (Supabase not configured).")
+                return
+
+            self.job_runner = JobRunner(bot=self, poll_seconds=30)
+
+            async def _handle_tax_run(job_row: dict) -> str:
+                sb = self.supabase
+                guild_id = int(job_row["guild_id"])
+                config = job_row.get("config") or {}
+                reason = config.get("reason") if isinstance(config, dict) else None
+                actor_id = int(self.user.id) if self.user else 0
+
+                def _do():
+                    return run_tax_job(
+                        sb,
+                        guild_id=guild_id,
+                        actor_discord_id=actor_id,
+                        reason=reason or "scheduled tax",
+                    )
+
+                summary = await asyncio.to_thread(_do)
+                return (
+                    f"Collected {summary['total']} from {summary['charged']} OCs "
+                    f"(skipped {summary['skipped']})."
+                )
+
+            async def _handle_stipend_run(job_row: dict) -> str:
+                sb = self.supabase
+                guild_id = int(job_row["guild_id"])
+                config = job_row.get("config") or {}
+                reason = config.get("reason") if isinstance(config, dict) else None
+                actor_id = int(self.user.id) if self.user else 0
+
+                summary = await run_stipend_job(
+                    bot=self,
+                    sb=sb,
+                    guild_id=guild_id,
+                    actor_discord_id=actor_id,
+                    reason=reason or "scheduled stipend",
+                )
+
+                return (
+                    f"Paid {summary['paid_total']} to {summary['recipients']} OCs "
+                    f"(skipped {summary['skipped']})."
+                )
+
+            self.job_runner.register("TAX_RUN", _handle_tax_run)
+            self.job_runner.register("STIPEND_RUN", _handle_stipend_run)
+            self.job_runner.start()
+
+            print("🕒 JobRunner started (poll=30s) with TAX_RUN + STIPEND_RUN handlers registered")
+
+        except Exception as e:
+            print(f"❌ Failed to start JobRunner: {e}")
+            traceback.print_exc()
+
     async def load_extensions(self):
-        """Load cogs. In Keystone mode, load only the allowlist."""
         loaded, failed = [], []
 
         if KEYSTONE_MODE:
@@ -121,8 +303,11 @@ class KeystoneBot(commands.Bot):
             print("❌ Failed: " + ", ".join(failed))
 
     async def on_ready(self):
-        print(f"\n🧱 Keystone Online!")
-        print(f"🔹 User: {self.user} (ID: {self.user.id})")
+        print("\n🧱 Keystone Online!")
+
+        if self.user:
+            print(f"🔹 User: {self.user} (ID: {self.user.id})")
+
         print(f"🔹 Guilds: {len(self.guilds)}")
         print(f"🔹 Uptime: {datetime.now(timezone.utc) - self.start_time}")
 
@@ -135,14 +320,69 @@ class KeystoneBot(commands.Bot):
 
     async def close(self):
         print("\n🔌 Shutting down gracefully...")
+
+        try:
+            if self.job_runner is not None:
+                await self.job_runner.stop()
+                print("🕒 JobRunner stopped")
+        except Exception:
+            traceback.print_exc()
+
         await super().close()
 
 
-# ── Boot ───────────────────────────────────────────────────────────────────────
 bot = KeystoneBot()
 
 
-# Log every slash-command interaction (confirms bot receives interactions)
+@bot.command(name="sync_commands")
+async def sync_commands(ctx: commands.Context):
+    """
+    Manual safe slash-command sync.
+
+    Usage:
+        !sync_commands
+
+    This does NOT clear commands first.
+    It is safe to use after changing slash command options, but do not spam it.
+    """
+    if not bot.can_run_dev_command(ctx.author):
+        return await ctx.reply("❌ Staff/dev only.", mention_author=False)
+
+    await ctx.reply("🔁 Safely syncing slash commands for the home guild...", mention_author=False)
+    synced = await bot.safe_sync_application_commands(source=f"manual:{ctx.author.id}")
+
+    if synced:
+        await ctx.reply(f"✅ Synced `{len(synced)}` slash command groups/commands.", mention_author=False)
+    else:
+        await ctx.reply(
+            "⚠️ Sync did not complete or nothing was returned. Check the console logs. "
+            "If you hit Discord's daily create limit, leave `SYNC_ON_BOOT=false` and try again after it resets.",
+            mention_author=False,
+        )
+
+
+@bot.command(name="sync_status")
+async def sync_status(ctx: commands.Context):
+    """
+    Quick local status check for command syncing config.
+    """
+    if not bot.can_run_dev_command(ctx.author):
+        return await ctx.reply("❌ Staff/dev only.", mention_author=False)
+
+    await ctx.reply(
+        "\n".join(
+            [
+                "🧱 **Keystone Sync Status**",
+                f"`GUILD_ID`: `{bot.guild_id}`",
+                f"`SYNC_ON_BOOT`: `{SYNC_ON_BOOT}`",
+                "`Clear-before-sync`: `disabled permanently in this patch`",
+                "Manual safe sync: `!sync_commands`",
+            ]
+        ),
+        mention_author=False,
+    )
+
+
 @bot.event
 async def on_interaction(interaction: discord.Interaction):
     if interaction.type == discord.InteractionType.application_command:
@@ -152,13 +392,14 @@ async def on_interaction(interaction: discord.Interaction):
         except Exception:
             print("➡️ Interaction received (application_command), could not read command name")
 
-    # Let discord.py route the interaction to app commands
     await bot.process_application_commands(interaction)
 
 
-# Global error handler for slash commands
 @bot.tree.error
-async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+async def on_app_command_error(
+    interaction: discord.Interaction,
+    error: app_commands.AppCommandError,
+):
     print("❌ App command error:", repr(error))
     traceback.print_exc()
 
@@ -172,13 +413,13 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
         pass
 
 
-# Supabase client (optional)
 if SUPABASE_URL and SUPABASE_KEY and create_client is not None:
     bot.supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
     print("✅ Supabase client attached to Keystone")
 else:
     print(
-        "⚠️ Supabase not configured (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY missing). "
+        "⚠️ Supabase not configured "
+        "(SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY missing). "
         "Anything that depends on Supabase will be disabled for now."
     )
 
