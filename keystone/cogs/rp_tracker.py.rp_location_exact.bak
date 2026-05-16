@@ -72,46 +72,6 @@ def xp_from_words(words: int) -> int:
     return paragraphs * 3
 
 
-def get_rp_location_payload(message: discord.Message) -> dict[str, Any]:
-    """Build durable Discord location fields for a tracked RP post.
-
-    The tracker only saves posts from threads, but this safely handles normal
-    channels too. For threads:
-    - thread_id/thread_name = the RP thread
-    - channel_id/channel_name = the parent channel, which is usually the broader location/category
-    - location_name = parent channel name first, then thread name
-    """
-    channel = message.channel
-    parent = getattr(channel, "parent", None)
-
-    is_thread = isinstance(channel, discord.Thread)
-
-    thread_id = int(channel.id) if is_thread else None
-    thread_name = str(getattr(channel, "name", "") or "") if is_thread else None
-
-    parent_channel_id = None
-    parent_channel_name = None
-
-    if parent is not None:
-        parent_channel_id = int(getattr(parent, "id", 0) or 0) or None
-        parent_channel_name = str(getattr(parent, "name", "") or "") or None
-
-    channel_id = parent_channel_id if parent_channel_id is not None else int(getattr(channel, "id", 0) or 0)
-    channel_name = parent_channel_name or str(getattr(channel, "name", "") or "") or None
-
-    location_name = parent_channel_name or thread_name or channel_name
-
-    return {
-        "thread_id": int(thread_id or channel.id),
-        "thread_name": thread_name,
-        "channel_id": int(channel_id) if channel_id is not None else None,
-        "channel_name": channel_name,
-        "parent_channel_id": parent_channel_id,
-        "parent_channel_name": parent_channel_name,
-        "location_name": location_name,
-        "jump_url": getattr(message, "jump_url", None),
-    }
-
 def thread_jump_url(guild_id: int, thread_id: int) -> str:
     return f"https://discord.com/channels/{guild_id}/{thread_id}"
 
@@ -418,7 +378,7 @@ class RPTools:
             "scene_id": scene_row["scene_id"],
             "message_id": int(message.id),
             "guild_id": int(message.guild.id),
-            **get_rp_location_payload(message),
+            "thread_id": int(message.channel.id),
             "user_id": int(participant["user_id"]),
             "character_id": participant["character_id"],
             "character_name": participant["character_name"],
