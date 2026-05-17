@@ -221,7 +221,7 @@ class SignalBell(commands.Cog):
                     guild_id=int(guild.id),
                     character_id=character_id,
                     amount=amount,
-                    source="bonus",
+                    source="staff",
                     title="Signal Bell bump reward",
                     actor_discord_id=int(user.id),
                     external_ref=f"signal_bell:{log_id}",
