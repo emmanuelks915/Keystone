@@ -15,7 +15,7 @@ from discord.ext import commands, tasks
 
 from services.currency_service import ensure_wallet, get_primary_currency
 from services.economy_service import transfer
-from services.oc_service import get_active_character
+from services.oc_service import get_active_character, list_characters
 from services.xp_service import XPDuplicateAwardError, XPService
 
 DISBOARD_BOT_ID = 302050872383242240
@@ -208,7 +208,30 @@ class SignalBell(commands.Cog):
         sb = self.sb()
         active = get_active_character(sb, int(user.id))
         if not active:
-            return {"ok": False, "message": "No active OC set. Use `/oc select <name>` first, then try again."}
+            # Fail safe: the bump still counts for the server, but rewards require an active OC.
+            try:
+                characters = list_characters(sb, int(user.id))
+            except Exception:
+                characters = []
+
+            if characters:
+                return {
+                    "ok": False,
+                    "message": (
+                        "🚂 Thanks for ringing the Signal Bell! I found OC records for you, "
+                        "but none are currently set as active. Use `/oc select <name>` first, "
+                        "then try claiming again before this reward expires."
+                    ),
+                }
+
+            return {
+                "ok": False,
+                "message": (
+                    "🚂 Thanks for ringing the Signal Bell! You do not currently have an OC registered "
+                    "with Keystone, so no reward was granted. Register an OC through the portal, then "
+                    "future Signal Bell bumps can reward your active OC."
+                ),
+            }
 
         character_id = str(active["character_id"])
         oc_name = str(active.get("name") or "your active OC")
