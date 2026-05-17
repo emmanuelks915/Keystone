@@ -114,6 +114,7 @@ KEYSTONE_EXTENSIONS = [
     "cogs.postwindow",
     "cogs.giveaway",
     "cogs.help",
+    "cogs.signal_bell",
 
 
 ]
