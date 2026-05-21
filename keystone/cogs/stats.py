@@ -116,12 +116,12 @@ class StatsCog(commands.Cog):
         current_lower = current.strip().lower()
 
         choices = []
-        for key in ["strength", "dexterity", "stamina", "affinity", "mana"]:
+        for key in ["strength", "dexterity", "stamina", "magic_affinity", "mana"]:
             label = {
                 "strength": "Strength",
                 "dexterity": "Dexterity",
                 "stamina": "Stamina",
-                "affinity": "Affinity",
+                "magic_affinity": "magic_affinity",
                 "mana": "Mana",
             }[key]
             if not current_lower or current_lower in key or current_lower in label.lower():
@@ -146,7 +146,7 @@ class StatsCog(commands.Cog):
                 core_map["dexterity"] = value
             elif raw_key == "stamina":
                 core_map["stamina"] = value
-            elif raw_key in ("affinity", "magic_affinity"):
+            elif raw_key in ("magic_affinity", "magic_affinity"):
                 core_map["magic_affinity"] = value
             elif raw_key == "mana":
                 core_map["mana"] = value
