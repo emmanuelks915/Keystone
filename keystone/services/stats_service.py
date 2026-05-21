@@ -25,7 +25,7 @@ STAT_ALIASES = {
 
     # current live DB key
     "aff": "magic_affinity",
-    "affinity": "magic_affinity",
+    "magic_affinity": "Magic Affinity",
 
     # compatibility aliases so old code / docs still work
     "mag": "magic_affinity",
@@ -45,7 +45,7 @@ DISPLAY_NAMES = {
     "strength": "Strength",
     "dexterity": "Dexterity",
     "stamina": "Stamina",
-    "affinity": "magic_affinity",
+    "magic_affinity": "Magic Affinity",
     "mana": "Mana",
     "luck": "Luck",
     "fortitude": "Fortitude",
@@ -324,3 +324,4 @@ class StatsService:
             "new_value": final_value,
             "delta": delta,
         }
+
