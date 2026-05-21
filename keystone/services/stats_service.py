@@ -8,7 +8,7 @@ CORE_STAT_KEYS = {
     "strength",
     "dexterity",
     "stamina",
-    "affinity",
+    "magic_affinity",
     "mana",
 }
 
@@ -24,14 +24,14 @@ STAT_ALIASES = {
     "stamina": "stamina",
 
     # current live DB key
-    "aff": "affinity",
-    "affinity": "affinity",
+    "aff": "magic_affinity",
+    "affinity": "magic_affinity",
 
     # compatibility aliases so old code / docs still work
-    "mag": "affinity",
-    "magic": "affinity",
-    "magic_affinity": "affinity",
-    "magic affinity": "affinity",
+    "mag": "magic_affinity",
+    "magic": "magic_affinity",
+    "magic_affinity": "magic_affinity",
+    "magic affinity": "magic_affinity",
 
     "mana": "mana",
 
@@ -45,7 +45,7 @@ DISPLAY_NAMES = {
     "strength": "Strength",
     "dexterity": "Dexterity",
     "stamina": "Stamina",
-    "affinity": "Affinity",
+    "affinity": "magic_affinity",
     "mana": "Mana",
     "luck": "Luck",
     "fortitude": "Fortitude",
