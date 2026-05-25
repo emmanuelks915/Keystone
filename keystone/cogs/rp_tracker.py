@@ -1516,34 +1516,39 @@ class RPTrackerCog(
                     ephemeral=True,
                 )
 
-            # If this OC/player already joined before, reactivate that exact row
-            # instead of inserting a duplicate. This lets people recover from
-            # accidental /scene leave without losing their scene.
+            # Current database rule:
+            # one participant row per scene + user.
+            #
+            # So if this player already has a row in this scene, we update that
+            # row instead of inserting. This fixes accidental /scene leave and
+            # also lets staff/player recover by switching the row back to the
+            # correct OC.
             existing_res = (
                 self.sb()
                 .table("rp_scene_participants")
                 .select("*")
                 .eq("scene_id", scene_row["scene_id"])
                 .eq("user_id", user_id)
-                .eq("character_id", oc_row["character_id"])
                 .limit(1)
                 .execute()
             )
             existing_rows = getattr(existing_res, "data", None) or []
 
             if existing_rows:
+                old_name = str(existing_rows[0].get("character_name") or "your previous OC")
+
                 self.sb().table("rp_scene_participants").update({
                     "is_active": True,
+                    "character_id": oc_row["character_id"],
                     "character_name": oc_row["name"],
                 }).eq("scene_id", scene_row["scene_id"]).eq(
                     "user_id", user_id
-                ).eq(
-                    "character_id", oc_row["character_id"]
                 ).execute()
 
                 return await interaction.followup.send(
-                    f"✅ Rejoined **{scene_row['title']}** as **{oc_row['name']}**. "
-                    "If any posts were missed while you were marked as left, run `/scene rescan`.",
+                    f"✅ Rejoined **{scene_row['title']}** as **{oc_row['name']}**.\n"
+                    f"Previous scene slot: **{old_name}**.\n"
+                    "If posts were missed while you were marked as left, run `/scene rescan`.",
                     ephemeral=True,
                 )
 
