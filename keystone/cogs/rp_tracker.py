@@ -1487,7 +1487,7 @@ class RPTrackerCog(
                 ephemeral=True,
             )
 
-    @app_commands.command(name="join", description="Join the current tracked scene with one of your OCs")
+    @app_commands.command(name="join", description="Join or rejoin the current tracked scene with one of your OCs")
     @app_commands.describe(oc="Your OC")
     @app_commands.autocomplete(oc=oc_name_autocomplete)
     async def scene_join(self, interaction: discord.Interaction, oc: str):
@@ -1516,11 +1516,43 @@ class RPTrackerCog(
                     ephemeral=True,
                 )
 
+            # If this OC/player already joined before, reactivate that exact row
+            # instead of inserting a duplicate. This lets people recover from
+            # accidental /scene leave without losing their scene.
+            existing_res = (
+                self.sb()
+                .table("rp_scene_participants")
+                .select("*")
+                .eq("scene_id", scene_row["scene_id"])
+                .eq("user_id", user_id)
+                .eq("character_id", oc_row["character_id"])
+                .limit(1)
+                .execute()
+            )
+            existing_rows = getattr(existing_res, "data", None) or []
+
+            if existing_rows:
+                self.sb().table("rp_scene_participants").update({
+                    "is_active": True,
+                    "character_name": oc_row["name"],
+                }).eq("scene_id", scene_row["scene_id"]).eq(
+                    "user_id", user_id
+                ).eq(
+                    "character_id", oc_row["character_id"]
+                ).execute()
+
+                return await interaction.followup.send(
+                    f"✅ Rejoined **{scene_row['title']}** as **{oc_row['name']}**. "
+                    "If any posts were missed while you were marked as left, run `/scene rescan`.",
+                    ephemeral=True,
+                )
+
             self.sb().table("rp_scene_participants").insert({
                 "scene_id": scene_row["scene_id"],
                 "character_id": oc_row["character_id"],
                 "user_id": user_id,
                 "character_name": oc_row["name"],
+                "is_active": True,
             }).execute()
 
             return await interaction.followup.send(
@@ -1532,7 +1564,7 @@ class RPTrackerCog(
             print(f"[scene join] error: {e}")
             traceback.print_exc()
             return await interaction.followup.send(
-                "Could not join scene. You may already be in this scene with another OC.",
+                "Could not join or rejoin this scene.",
                 ephemeral=True,
             )
 
@@ -1750,6 +1782,77 @@ class RPTrackerCog(
             traceback.print_exc()
             return await interaction.followup.send(
                 "Server error fetching your scene totals.",
+                ephemeral=True,
+            )
+
+    @app_commands.command(name="rescan", description="Re-scan this scene and count missed RP posts")
+    async def scene_rescan(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        if not isinstance(interaction.channel, discord.Thread):
+            return await interaction.followup.send(
+                "Use this inside a tracked RP thread.",
+                ephemeral=True,
+            )
+
+        if not interaction.guild:
+            return await interaction.followup.send(
+                "Use this in a server, not DMs.",
+                ephemeral=True,
+            )
+
+        try:
+            scene_row = await self.get_active_scene_by_thread(int(interaction.channel.id))
+            if not scene_row:
+                return await interaction.followup.send(
+                    "This is not an open tracked RP scene.",
+                    ephemeral=True,
+                )
+
+            checked = 0
+            saved = 0
+            skipped = 0
+
+            async for message in interaction.channel.history(
+                limit=1000,
+                oldest_first=True,
+            ):
+                checked += 1
+
+                if not is_valid_rp_message(message):
+                    skipped += 1
+                    continue
+
+                participant = await self.resolve_participant_for_message(
+                    scene_row,
+                    message,
+                )
+
+                if not participant:
+                    skipped += 1
+                    continue
+
+                await self.save_tracked_post(
+                    scene_row=scene_row,
+                    message=message,
+                    participant=participant,
+                )
+                saved += 1
+
+            return await interaction.followup.send(
+                f"✅ Scene rescan complete.\n"
+                f"Checked: `{checked}` messages\n"
+                f"Tracked/updated: `{saved}` posts\n"
+                f"Skipped: `{skipped}` messages\n\n"
+                "Run `/scene info` to confirm the updated totals.",
+                ephemeral=True,
+            )
+
+        except Exception as e:
+            print(f"[scene rescan] error: {e}")
+            traceback.print_exc()
+            return await interaction.followup.send(
+                "Server error rescanning this scene.",
                 ephemeral=True,
             )
 
