@@ -1938,6 +1938,33 @@ class RPTrackerCog(
                 value=f"`{approval_cards_sent}`",
                 inline=True,
             )
+
+            total_estimated_xp = sum(
+                xp_from_words(int(data.get("words") or 0))
+                for data in totals.values()
+            ) if scene_row["xp_eligible"] else 0
+
+            if total_estimated_xp > 0 and approval_cards_sent == 0:
+                approval_channel = await self.get_approval_channel()
+                if approval_channel is None:
+                    embed.add_field(
+                        name="Approval Warning",
+                        value=(
+                            "XP claims may have been saved, but I could not access the approval channel. "
+                            "Check `RP_XP_APPROVAL_CHANNEL_ID`, then run `!resend_rp_xp_cards` in this thread."
+                        ),
+                        inline=False,
+                    )
+                else:
+                    embed.add_field(
+                        name="Approval Notice",
+                        value=(
+                            "No new approval cards were sent. If cards are missing, run "
+                            "`!resend_rp_xp_cards` in this thread."
+                        ),
+                        inline=False,
+                    )
+
             embed.add_field(
                 name="Final Totals",
                 value="\n".join(lines) if lines else "No tracked RP posts were logged.",
@@ -2484,6 +2511,34 @@ class RPEventCog(
             embed.add_field(name="Tracked Threads Finalized", value=f"`{len(scenes)}`", inline=True)
             embed.add_field(name="XP Eligible", value="Yes" if event_row["xp_eligible"] else "No", inline=True)
             embed.add_field(name="Approval Cards Sent", value=f"`{approval_cards_sent}`", inline=True)
+
+            total_estimated_xp = sum(
+                xp_from_words(int(data.get("words") or 0))
+                for data in totals.values()
+            ) if event_row["xp_eligible"] else 0
+
+            if total_estimated_xp > 0 and approval_cards_sent == 0:
+                approval_channel = await self.get_approval_channel()
+                if approval_channel is None:
+                    embed.add_field(
+                        name="Approval Warning",
+                        value=(
+                            "XP claims may have been saved, but I could not access the approval channel. "
+                            "Check `RP_XP_APPROVAL_CHANNEL_ID`. Scene resend recovery works per thread with "
+                            "`!resend_rp_xp_cards`."
+                        ),
+                        inline=False,
+                    )
+                else:
+                    embed.add_field(
+                        name="Approval Notice",
+                        value=(
+                            "No new approval cards were sent. If cards are missing from a scene thread, run "
+                            "`!resend_rp_xp_cards` inside that thread."
+                        ),
+                        inline=False,
+                    )
+
             embed.add_field(
                 name="Final Event Totals",
                 value="\n".join(lines) if lines else "No tracked RP posts were logged.",
@@ -2526,6 +2581,100 @@ class RPEventCog(
             traceback.print_exc()
 
 
+@commands.command(name="resend_rp_xp_cards")
+@commands.has_permissions(administrator=True)
+async def resend_rp_xp_cards(ctx: commands.Context):
+    """Resend missing RP XP approval cards for the current scene thread.
+
+    Use this inside a tracked RP thread after a scene was closed if Supabase
+    created pending rp_xp_claims but Discord approval cards were not posted.
+    """
+    if not isinstance(ctx.channel, discord.Thread):
+        return await ctx.reply(
+            "Use this inside the RP thread that needs approval cards resent.",
+            mention_author=False,
+        )
+
+    cog = ctx.bot.get_cog("RPTrackerCog")
+    if cog is None:
+        return await ctx.reply(
+            "RP tracker cog is not loaded.",
+            mention_author=False,
+        )
+
+    try:
+        scene_row = await cog.get_scene_by_thread(int(ctx.channel.id))
+        if not scene_row:
+            return await ctx.reply(
+                "I could not find a tracked scene for this thread.",
+                mention_author=False,
+            )
+
+        claims_res = (
+            cog.sb()
+            .table("rp_xp_claims")
+            .select("*")
+            .eq("scene_id", scene_row["scene_id"])
+            .eq("status", "pending")
+            .execute()
+        )
+        claims = getattr(claims_res, "data", None) or []
+
+        missing = [
+            claim for claim in claims
+            if not claim.get("approval_message_id")
+        ]
+
+        if not missing:
+            return await ctx.reply(
+                "No missing pending RP XP approval cards found for this scene.",
+                mention_author=False,
+            )
+
+        approval_channel = await cog.get_approval_channel()
+        if approval_channel is None:
+            return await ctx.reply(
+                "I found pending RP XP claims, but I cannot access the approval channel. "
+                "Check `RP_XP_APPROVAL_CHANNEL_ID` in Railway and make sure Keystone can view/send there.",
+                mention_author=False,
+            )
+
+        sent = 0
+        failed = 0
+
+        for claim in missing:
+            try:
+                ok = await cog.dispatch_approval_card(claim)
+                if ok:
+                    sent += 1
+                else:
+                    failed += 1
+            except Exception:
+                traceback.print_exc()
+                failed += 1
+
+        await ctx.reply(
+            f"✅ RP XP approval card resend complete.\n"
+            f"Sent: `{sent}`\n"
+            f"Failed: `{failed}`\n\n"
+            f"If failed is above 0, check `RP_XP_APPROVAL_CHANNEL_ID` in Railway.",
+            mention_author=False,
+        )
+
+    except Exception as e:
+        print(f"[resend_rp_xp_cards] error: {e}")
+        traceback.print_exc()
+        await ctx.reply(
+            "Server error while resending RP XP approval cards.",
+            mention_author=False,
+        )
+
+
 async def setup(bot: commands.Bot):
     await bot.add_cog(RPTrackerCog(bot))
     await bot.add_cog(RPEventCog(bot))
+
+    # Prefix fallback for recovery when approval cards fail to post.
+    # This does not require Discord slash-command sync.
+    if bot.get_command("resend_rp_xp_cards") is None:
+        bot.add_command(resend_rp_xp_cards)
