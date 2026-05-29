@@ -1,7 +1,8 @@
 # cogs/signal_bell.py
 # Keystone • The Signal Bell
-# Detects successful DISBOARD bumps, lets the bumper claim 1 XP or 1 primary currency
-# for their active OC, logs to Supabase, and pings Signal Crew when the cooldown ends.
+# Detects successful DISBOARD bumps, lets the bumper claim 1 XP + 1 primary currency
+# for their active OC, enforces a rolling 24-hour reward cap, logs to Supabase,
+# and pings Signal Crew when the cooldown ends.
 
 from __future__ import annotations
 
@@ -24,6 +25,7 @@ SIGNAL_BELL_CHANNEL_ID = int(os.getenv("SIGNAL_BELL_CHANNEL_ID", "0") or "0")
 SIGNAL_BELL_ROLE_ID = int(os.getenv("SIGNAL_BELL_ROLE_ID", "0") or "0")
 SIGNAL_BELL_REWARD_AMOUNT = int(os.getenv("SIGNAL_BELL_REWARD_AMOUNT", "1") or "1")
 SIGNAL_BELL_COOLDOWN_HOURS = int(os.getenv("SIGNAL_BELL_COOLDOWN_HOURS", "2") or "2")
+SIGNAL_BELL_REWARD_CAP_24H = int(os.getenv("SIGNAL_BELL_REWARD_CAP_24H", "4") or "4")
 
 
 class SignalRewardView(discord.ui.View):
@@ -33,7 +35,7 @@ class SignalRewardView(discord.ui.View):
         self.log_id = str(log_id)
         self.bumper_id = int(bumper_id)
 
-    async def _claim(self, interaction: discord.Interaction, reward_type: str):
+    async def _claim(self, interaction: discord.Interaction):
         if int(interaction.user.id) != self.bumper_id:
             return await interaction.response.send_message(
                 "Only the person who rang the Signal Bell can claim this reward.",
@@ -47,7 +49,6 @@ class SignalRewardView(discord.ui.View):
                 guild=interaction.guild,
                 user=interaction.user,
                 log_id=self.log_id,
-                reward_type=reward_type,
             )
         except Exception:
             traceback.print_exc()
@@ -66,13 +67,9 @@ class SignalRewardView(discord.ui.View):
 
         return await interaction.followup.send(result["message"], ephemeral=True)
 
-    @discord.ui.button(label="Claim 1 XP", style=discord.ButtonStyle.primary, custom_id="signal_bell:claim_xp")
-    async def claim_xp(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._claim(interaction, "xp")
-
-    @discord.ui.button(label="Claim 1 Currency", style=discord.ButtonStyle.success, custom_id="signal_bell:claim_currency")
-    async def claim_currency(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._claim(interaction, "currency")
+    @discord.ui.button(label="Claim Signal Reward", style=discord.ButtonStyle.success, custom_id="signal_bell:claim_reward")
+    async def claim_signal_reward(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._claim(interaction)
 
 
 class SignalBell(commands.Cog):
@@ -174,6 +171,40 @@ class SignalBell(commands.Cog):
         rows = getattr(res, "data", None) or []
         return rows[0] if rows else None
 
+    def _parse_dt(self, value: Any) -> datetime | None:
+        if not value:
+            return None
+        if isinstance(value, datetime):
+            dt = value
+        else:
+            dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+
+    def _reward_cap_status(self, guild_id: int, bumper_id: int) -> dict[str, Any]:
+        """Return rolling 24-hour reward cap status for a bumper."""
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(hours=24)
+        res = (
+            self.sb()
+            .table("signal_bell_logs")
+            .select("id,reward_claimed_at")
+            .eq("guild_id", int(guild_id))
+            .eq("bumper_id", int(bumper_id))
+            .eq("reward_claimed", True)
+            .gte("reward_claimed_at", cutoff.isoformat())
+            .order("reward_claimed_at", desc=False)
+            .execute()
+        )
+        rows = getattr(res, "data", None) or []
+        cap = max(0, int(SIGNAL_BELL_REWARD_CAP_24H))
+        if cap and len(rows) >= cap:
+            oldest = self._parse_dt(rows[0].get("reward_claimed_at")) or now
+            reset_at = oldest + timedelta(hours=24)
+            return {"eligible": False, "count": len(rows), "cap": cap, "reset_at": reset_at}
+        return {"eligible": True, "count": len(rows), "cap": cap, "reset_at": None}
+
     def _mark_claimed(self, log_id: str, reward_type: str, character_id: str):
         self.sb().table("signal_bell_logs").update(
             {
@@ -190,7 +221,6 @@ class SignalBell(commands.Cog):
         guild: discord.Guild | None,
         user: discord.abc.User,
         log_id: str,
-        reward_type: str,
     ) -> dict[str, Any]:
         if guild is None:
             return {"ok": False, "message": "Use this in a server, not DMs."}
@@ -233,50 +263,59 @@ class SignalBell(commands.Cog):
                 ),
             }
 
+        cap_status = self._reward_cap_status(int(guild.id), int(user.id))
+        if not cap_status["eligible"]:
+            reset_at = cap_status.get("reset_at")
+            reset_text = f" <t:{int(reset_at.timestamp())}:R>" if reset_at else " once the 24-hour timer resets"
+            return {
+                "ok": False,
+                "message": (
+                    f"🚂 Thanks for ringing the Signal Bell! You have already claimed "
+                    f"{cap_status['count']}/{cap_status['cap']} Signal Bell rewards in the last 24 hours. "
+                    f"You can claim another reward{reset_text}."
+                ),
+            }
+
         character_id = str(active["character_id"])
         oc_name = str(active.get("name") or "your active OC")
         amount = int(log.get("reward_amount") or SIGNAL_BELL_REWARD_AMOUNT or 1)
 
-        if reward_type == "xp":
-            xp = XPService(sb)
-            try:
-                xp.award_xp(
-                    guild_id=int(guild.id),
-                    character_id=character_id,
-                    amount=amount,
-                    source="staff",
-                    title="Signal Bell bump reward",
-                    actor_discord_id=int(user.id),
-                    external_ref=f"signal_bell:{log_id}",
-                    notes="Reward for manually bumping Railbound through DISBOARD.",
-                )
-            except XPDuplicateAwardError:
-                return {"ok": False, "message": "That XP reward was already claimed."}
-
-            self._mark_claimed(log_id, "xp", character_id)
-            return {"ok": True, "message": f"✅ **{oc_name}** received `{amount}` XP from the Signal Bell."}
-
-        if reward_type == "currency":
-            cur = get_primary_currency(sb, int(guild.id))
-            ensure_wallet(sb, character_id, cur["currency_id"])
-            transfer(
-                sb,
+        xp = XPService(sb)
+        try:
+            xp.award_xp(
                 guild_id=int(guild.id),
-                currency_id=cur["currency_id"],
+                character_id=character_id,
                 amount=amount,
-                tx_type="mint",
+                source="staff",
+                title="Signal Bell bump reward",
                 actor_discord_id=int(user.id),
-                from_character_id=None,
-                to_character_id=character_id,
-                reason="Signal Bell bump reward",
+                external_ref=f"signal_bell:{log_id}:xp",
+                notes="Reward for manually bumping Railbound through DISBOARD.",
             )
+        except XPDuplicateAwardError:
+            return {"ok": False, "message": "That XP reward was already claimed."}
 
-            self._mark_claimed(log_id, "currency", character_id)
-            emoji = cur.get("emoji") or ""
-            name = cur.get("name") or "currency"
-            return {"ok": True, "message": f"✅ **{oc_name}** received {emoji} `{amount}` **{name}** from the Signal Bell."}
+        cur = get_primary_currency(sb, int(guild.id))
+        ensure_wallet(sb, character_id, cur["currency_id"])
+        transfer(
+            sb,
+            guild_id=int(guild.id),
+            currency_id=cur["currency_id"],
+            amount=amount,
+            tx_type="mint",
+            actor_discord_id=int(user.id),
+            from_character_id=None,
+            to_character_id=character_id,
+            reason="Signal Bell bump reward",
+        )
 
-        return {"ok": False, "message": "Unknown reward type."}
+        self._mark_claimed(log_id, "combined", character_id)
+        emoji = cur.get("emoji") or ""
+        name = cur.get("name") or "currency"
+        return {
+            "ok": True,
+            "message": f"✅ **{oc_name}** received `{amount}` XP and {emoji} `{amount}` **{name}** from the Signal Bell.",
+        }
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
