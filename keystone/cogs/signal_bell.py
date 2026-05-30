@@ -159,6 +159,28 @@ class SignalBell(commands.Cog):
         data = getattr(res, "data", None) or []
         return data[0] if data else row
 
+    def _mark_older_unannounced_logs_handled(self, *, guild_id: int, channel_id: int, keep_log_id: str):
+        """Prevent stale bump logs from causing false ready pings.
+
+        DISBOARD cooldown state should follow the newest successful bump in the Signal Bell
+        channel. Older unannounced rows are marked handled as soon as a newer bump is logged.
+        """
+        if not keep_log_id:
+            return
+        try:
+            (
+                self.sb()
+                .table("signal_bell_logs")
+                .update({"ready_announced": True})
+                .eq("guild_id", int(guild_id))
+                .eq("channel_id", int(channel_id))
+                .eq("ready_announced", False)
+                .neq("id", str(keep_log_id))
+                .execute()
+            )
+        except Exception:
+            traceback.print_exc()
+
     def _get_log(self, log_id: str) -> dict[str, Any] | None:
         res = (
             self.sb()
@@ -342,6 +364,11 @@ class SignalBell(commands.Cog):
             next_bump_at=next_bump_at,
         )
         log_id = str(log.get("id") or "")
+        self._mark_older_unannounced_logs_handled(
+            guild_id=int(message.guild.id),
+            channel_id=int(message.channel.id),
+            keep_log_id=log_id,
+        )
 
         description = (
             ":steam_locomotive: **The Signal Bell rings across the station...**\n"
@@ -363,16 +390,17 @@ class SignalBell(commands.Cog):
         if not SIGNAL_BELL_CHANNEL_ID:
             return
 
-        now = datetime.now(timezone.utc).isoformat()
         try:
+            # Source of truth: only the newest successful DISBOARD bump in the Signal Bell
+            # channel can trigger the ready ping. Older rows may exist from tests/restarts,
+            # but they should never announce over a newer active cooldown.
             res = (
                 self.sb()
                 .table("signal_bell_logs")
                 .select("*")
-                .eq("ready_announced", False)
-                .lte("next_bump_at", now)
-                .order("next_bump_at", desc=False)
-                .limit(5)
+                .eq("channel_id", int(SIGNAL_BELL_CHANNEL_ID))
+                .order("bumped_at", desc=True)
+                .limit(1)
                 .execute()
             )
             rows = getattr(res, "data", None) or []
@@ -380,28 +408,38 @@ class SignalBell(commands.Cog):
             traceback.print_exc()
             return
 
-        for row in rows:
-            guild = self.bot.get_guild(int(row.get("guild_id") or 0))
-            if not guild:
-                continue
+        if not rows:
+            return
 
-            channel_id = int(row.get("channel_id") or SIGNAL_BELL_CHANNEL_ID)
-            channel = guild.get_channel(channel_id)
-            if channel is None:
-                try:
-                    channel = await guild.fetch_channel(channel_id)
-                except Exception:
-                    continue
+        row = rows[0]
+        if row.get("ready_announced"):
+            return
 
-            role_text = f"<@&{SIGNAL_BELL_ROLE_ID}>\n" if SIGNAL_BELL_ROLE_ID else ""
+        next_bump_at = self._parse_dt(row.get("next_bump_at"))
+        if not next_bump_at or next_bump_at > datetime.now(timezone.utc):
+            return
+
+        guild = self.bot.get_guild(int(row.get("guild_id") or 0))
+        if not guild:
+            return
+
+        channel_id = int(row.get("channel_id") or SIGNAL_BELL_CHANNEL_ID)
+        channel = guild.get_channel(channel_id)
+        if channel is None:
             try:
-                await channel.send(
-                    f"{role_text}:mega: **The rails are quiet once more.**\n"
-                    "*The Signal Bell is ready to ring again.*"
-                )
-                self.sb().table("signal_bell_logs").update({"ready_announced": True}).eq("id", row["id"]).execute()
+                channel = await guild.fetch_channel(channel_id)
             except Exception:
-                traceback.print_exc()
+                return
+
+        role_text = f"<@&{SIGNAL_BELL_ROLE_ID}>\n" if SIGNAL_BELL_ROLE_ID else ""
+        try:
+            await channel.send(
+                f"{role_text}:mega: **The rails are quiet once more.**\n"
+                "*The Signal Bell is ready to ring again.*"
+            )
+            self.sb().table("signal_bell_logs").update({"ready_announced": True}).eq("id", row["id"]).execute()
+        except Exception:
+            traceback.print_exc()
 
     @ready_check.before_loop
     async def before_ready_check(self):
