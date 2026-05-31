@@ -89,19 +89,35 @@ class SignalBell(commands.Cog):
     def _is_disboard_success(self, message: discord.Message) -> bool:
         content = (message.content or "").lower()
         embed_parts: list[str] = []
+
         for embed in message.embeds:
             embed_parts.append(embed.title or "")
             embed_parts.append(embed.description or "")
             for field in embed.fields:
                 embed_parts.append(field.name or "")
                 embed_parts.append(field.value or "")
+
         combined = f"{content} {' '.join(embed_parts).lower()}"
 
+        # DISBOARD cooldown/failure responses include phrases like:
+        # "Please wait another X minutes until the server can be bumped."
+        # Never treat those as successful bumps.
+        failure_phrases = (
+            "please wait",
+            "until the server can be bumped",
+            "can be bumped",
+            "wait another",
+            "try again",
+        )
+        if any(phrase in combined for phrase in failure_phrases):
+            return False
+
+        # Keep success matching strict. Avoid the plain word "bumped" because it
+        # appears inside failed cooldown text: "server can be bumped."
         success_phrases = (
             "bump done",
-            "bumped",
-            "server bumped",
             "bump successful",
+            "server bumped successfully",
             "done bumping",
         )
         return any(phrase in combined for phrase in success_phrases)
