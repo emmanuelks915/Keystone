@@ -2597,6 +2597,7 @@ class ShopCog(commands.GroupCog, group_name="shop", group_description="Shop tool
             item = self._get_item(sb, guild_id, str(order["item_id"]))
             item_name = str(item.get("name") or "Item") if item else "Item"
 
+            # ── Mark order denied first ────────────────────────────────────
             sb.table("shop_orders").update(
                 {
                     "status": "DENIED",
@@ -2607,21 +2608,81 @@ class ShopCog(commands.GroupCog, group_name="shop", group_description="Shop tool
             ).eq("guild_id", guild_id).eq("order_id", str(order["order_id"])).execute()
 
             code = self._short_order_code(str(order["order_id"]))
+
+            # ── Refund the buyer ───────────────────────────────────────────
+            # Currency was charged at purchase time. We return it now by
+            # moving it back from the vendor company to the buyer character.
+            refund_ok = False
+            refund_err = ""
+            refund_amount = int(order.get("total") or 0)
+            buyer_character_id = str(order.get("buyer_character_id") or "")
+            vendor_company_id = str(order.get("vendor_company_id") or "")
+            currency_id = str(order.get("currency_id") or "")
+
+            if refund_amount > 0 and buyer_character_id and vendor_company_id and currency_id:
+                try:
+                    apply_company_transaction(
+                        sb,
+                        guild_id=guild_id,
+                        currency_id=currency_id,
+                        tx_type="WITHDRAW",
+                        amount=refund_amount,
+                        actor_discord_id=int(interaction.user.id),
+                        from_company_id=vendor_company_id,
+                        to_character_id=buyer_character_id,
+                        reason=f"refund denied order {code}",
+                    )
+                    refund_ok = True
+                except Exception as refund_ex:
+                    refund_err = str(refund_ex)
+                    traceback.print_exc()
+
+            # ── Notify buyer in receipts channel ──────────────────────────
+            try:
+                cur = get_primary_currency(sb, guild_id)
+                emoji = cur.get("emoji") or "🪙"
+                ticker = cur.get("ticker") or cur.get("name") or "CUR"
+                denial_embed = discord.Embed(title="❌ Order Denied", color=discord.Color.red())
+                denial_embed.add_field(name="Order", value=f"`{code}`", inline=True)
+                denial_embed.add_field(name="Item", value=f"**{item_name}**", inline=True)
+                denial_embed.add_field(name="Reason", value=(reason or "Denied by staff")[:900], inline=False)
+                if refund_ok:
+                    denial_embed.add_field(
+                        name="Refund",
+                        value=f"✅ {emoji}`{refund_amount}` {ticker} returned to your wallet.",
+                        inline=False,
+                    )
+                else:
+                    denial_embed.add_field(
+                        name="Refund",
+                        value="⚠️ Automatic refund failed — please contact staff.",
+                        inline=False,
+                    )
+                denial_embed.timestamp = discord.utils.utcnow()
+                await self._post_receipt_to_channel(interaction, embed=denial_embed, ping_user=True)
+            except Exception:
+                traceback.print_exc()
+
+            # ── Ledger ─────────────────────────────────────────────────────
             led = discord.Embed(title="📒 Shop Ledger", color=discord.Color.red())
             led.add_field(name="Action", value="DENY_ORDER", inline=True)
             led.add_field(name="Order", value=f"`{code}`", inline=True)
             led.add_field(name="Buyer", value=f"<@{int(order['buyer_discord_id'])}>", inline=True)
             led.add_field(name="Item", value=f"**{item_name}**", inline=False)
             led.add_field(name="Reason", value=(reason or "Denied by staff")[:900], inline=False)
+            led.add_field(name="Refund Issued", value=str(refund_ok), inline=True)
+            if not refund_ok and refund_err:
+                led.add_field(name="Refund Error", value=refund_err[:200], inline=False)
             led.add_field(name="By", value=interaction.user.mention, inline=False)
             led.timestamp = discord.utils.utcnow()
             await self._post_ledger(interaction, embed=led)
 
-            return await self._public(
-                interaction,
-                content=f"❌ Denied order `{code}`. Note: this marks the order denied; it does not automatically refund currency.",
-                ephemeral=False,
-            )
+            staff_msg = f"❌ Denied order `{code}`."
+            if refund_ok:
+                staff_msg += f" Refund of `{refund_amount}` issued to buyer."
+            else:
+                staff_msg += " ⚠️ Refund failed — check logs and refund manually."
+            return await self._public(interaction, content=staff_msg, ephemeral=False)
 
         except Exception:
             traceback.print_exc()
