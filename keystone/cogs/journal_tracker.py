@@ -7,8 +7,10 @@ from datetime import timezone
 from typing import Any
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 
+from services.autocomplete_service import oc_name_autocomplete
 from services.xp_service import (
     XPDuplicateAwardError,
     XPService,
@@ -29,6 +31,14 @@ RP_XP_AUDIT_CHANNEL_ID = int(os.getenv("RP_XP_AUDIT_CHANNEL_ID", "14737182341747
 
 def normalize_oc_name(value: str) -> str:
     return re.sub(r"\s+", " ", (value or "").strip()).casefold()
+
+
+def get_message_display_name(message: discord.Message) -> str:
+    return (
+        getattr(message.author, "display_name", None)
+        or getattr(message.author, "name", None)
+        or ""
+    ).strip()
 
 
 def count_words(content: str) -> int:
@@ -149,12 +159,16 @@ class JournalXPDenyModal(discord.ui.Modal):
                 )
 
 
-class JournalTrackerCog(commands.Cog):
+class JournalTrackerCog(
+    commands.GroupCog,
+    group_name="journal",
+    group_description="Canon Fiction / journal XP commands",
+):
     """Canon Fiction / solo writing XP tracker.
 
-    Players run `!journal_submit OC Name` inside a Canon Fiction forum post/thread.
-    The cog counts that user's messages in the thread, creates an approval card,
-    and pays through XPService after staff approval.
+    Players use `/journal count` or `/journal submit` inside a Canon Fiction
+    forum post/thread. The cog counts eligible writing in the thread, creates
+    an approval card, and pays through XPService after staff approval.
     """
 
     def __init__(self, bot: commands.Bot):
@@ -714,15 +728,29 @@ class JournalTrackerCog(commands.Cog):
         *,
         thread: discord.Thread,
         author_id: int,
+        oc_name: str | None = None,
     ) -> tuple[int, int]:
+        """Count eligible Canon Fiction writing in a forum thread.
+
+        Normal Discord posts are matched by the player's Discord ID.
+        Tupper/webhook posts are matched by OC name, because their author is the
+        webhook/bot rather than the player.
+        """
         words = 0
         posts = 0
+        target_oc = normalize_oc_name(oc_name or "")
 
         async for message in thread.history(limit=1000, oldest_first=True):
-            if int(message.author.id) != int(author_id):
+            if not is_valid_journal_message(message):
                 continue
 
-            if not is_valid_journal_message(message):
+            is_user_message = int(message.author.id) == int(author_id)
+
+            is_matching_tupper = False
+            if target_oc and message.webhook_id is not None:
+                is_matching_tupper = normalize_oc_name(get_message_display_name(message)) == target_oc
+
+            if not is_user_message and not is_matching_tupper:
                 continue
 
             words += count_words(message.content)
@@ -752,95 +780,166 @@ class JournalTrackerCog(commands.Cog):
         rows = getattr(res, "data", None) or []
         return rows[0] if rows else None
 
-    @commands.command(name="journal_submit")
-    async def journal_submit(self, ctx: commands.Context, *, oc: str):
-        """Submit the current Canon Fiction forum post for XP review.
+    def is_canon_fiction_thread(self, thread: discord.Thread) -> bool:
+        if not CANON_FICTION_FORUM_ID:
+            return True
+        return int(thread.parent_id or 0) == CANON_FICTION_FORUM_ID
 
-        Usage:
-            !journal_submit OC Name
-        """
+    @app_commands.command(name="count", description="Count your Canon Fiction / journal words in this post")
+    @app_commands.describe(
+        oc="Optional: your OC name. Use this when the post was made through Tupper.",
+    )
+    @app_commands.autocomplete(oc=oc_name_autocomplete)
+    async def journal_count(self, interaction: discord.Interaction, oc: str | None = None):
+        await interaction.response.defer(ephemeral=True)
 
-        if not isinstance(ctx.channel, discord.Thread):
-            return await ctx.reply(
-                "Use this inside the Canon Fiction forum post/thread you want to submit.",
-                mention_author=False,
+        if not isinstance(interaction.channel, discord.Thread):
+            return await interaction.followup.send(
+                "Use this inside a Canon Fiction forum post/thread.",
+                ephemeral=True,
             )
 
-        if not ctx.guild:
-            return await ctx.reply(
-                "Use this in the server, not DMs.",
-                mention_author=False,
-            )
-
-        if CANON_FICTION_FORUM_ID and int(ctx.channel.parent_id or 0) != CANON_FICTION_FORUM_ID:
-            return await ctx.reply(
+        if not self.is_canon_fiction_thread(interaction.channel):
+            return await interaction.followup.send(
                 "This does not look like the configured Canon Fiction forum.",
-                mention_author=False,
+                ephemeral=True,
             )
 
         try:
-            oc_row = await self.get_owned_oc_by_name(int(ctx.author.id), oc)
+            oc_row = None
+            oc_name = None
+
+            if oc:
+                oc_row = await self.get_owned_oc_by_name(int(interaction.user.id), oc)
+                if not oc_row:
+                    return await interaction.followup.send(
+                        "OC not found, or that OC is not yours. Make sure the OC is registered with Keystone.",
+                        ephemeral=True,
+                    )
+                oc_name = oc_row["name"]
+
+            words, posts = await self.count_author_posts_in_thread(
+                thread=interaction.channel,
+                author_id=int(interaction.user.id),
+                oc_name=oc_name,
+            )
+
+            estimated_xp = journal_xp_from_words(words)
+
+            note = ""
+            if not oc_name and words == 0:
+                note = (
+                    "\n\nIf this post was made through Tupper, run `/journal count` again "
+                    "and pick the OC so Keystone can match the Tupper name."
+                )
+
+            label = f" for **{oc_name}**" if oc_name else f" for **{interaction.user.display_name}**"
+            return await interaction.followup.send(
+                f"Canon Fiction count{label}:\n"
+                f"Words: `{words}`\n"
+                f"Posts counted: `{posts}`\n"
+                f"Estimated XP: `{estimated_xp}`\n"
+                f"Rate: `{JOURNAL_XP_WORDS_PER_CHUNK}` words = `{JOURNAL_XP_PER_CHUNK}` XP"
+                f"{note}",
+                ephemeral=True,
+            )
+
+        except Exception as e:
+            print(f"[journal count] error: {e}")
+            traceback.print_exc()
+            return await interaction.followup.send(
+                "Server error while counting this Canon Fiction post.",
+                ephemeral=True,
+            )
+
+    @app_commands.command(name="submit", description="Submit this Canon Fiction / journal post for XP approval")
+    @app_commands.describe(oc="Your registered OC for this Canon Fiction post")
+    @app_commands.autocomplete(oc=oc_name_autocomplete)
+    async def journal_submit(self, interaction: discord.Interaction, oc: str):
+        await interaction.response.defer(ephemeral=True)
+
+        if not isinstance(interaction.channel, discord.Thread):
+            return await interaction.followup.send(
+                "Use this inside the Canon Fiction forum post/thread you want to submit.",
+                ephemeral=True,
+            )
+
+        if not interaction.guild:
+            return await interaction.followup.send(
+                "Use this in the server, not DMs.",
+                ephemeral=True,
+            )
+
+        if not self.is_canon_fiction_thread(interaction.channel):
+            return await interaction.followup.send(
+                "This does not look like the configured Canon Fiction forum.",
+                ephemeral=True,
+            )
+
+        try:
+            oc_row = await self.get_owned_oc_by_name(int(interaction.user.id), oc)
             if not oc_row:
-                return await ctx.reply(
+                return await interaction.followup.send(
                     "OC not found, or that OC is not yours. Make sure the OC is registered with Keystone.",
-                    mention_author=False,
+                    ephemeral=True,
                 )
 
             words, posts = await self.count_author_posts_in_thread(
-                thread=ctx.channel,
-                author_id=int(ctx.author.id),
+                thread=interaction.channel,
+                author_id=int(interaction.user.id),
+                oc_name=oc_row["name"],
             )
 
             estimated_xp = journal_xp_from_words(words)
 
             if estimated_xp <= 0:
-                return await ctx.reply(
-                    f"This post currently has `{words}` eligible words from you.\n"
+                return await interaction.followup.send(
+                    f"This post currently has `{words}` eligible words for **{oc_row['name']}**.\n"
                     f"Canon Fiction XP requires at least `{JOURNAL_XP_WORDS_PER_CHUNK}` words "
                     f"for `{JOURNAL_XP_PER_CHUNK}` XP.",
-                    mention_author=False,
+                    ephemeral=True,
                 )
 
             existing = await self.find_existing_journal_claim(
-                guild_id=int(ctx.guild.id),
-                journal_thread_id=int(ctx.channel.id),
+                guild_id=int(interaction.guild.id),
+                journal_thread_id=int(interaction.channel.id),
                 character_id=oc_row["character_id"],
             )
 
             if existing:
                 if existing.get("approval_message_id"):
-                    return await ctx.reply(
+                    return await interaction.followup.send(
                         f"A Canon Fiction XP claim already exists for **{oc_row['name']}** in this post "
                         f"with status **{existing.get('status')}**.",
-                        mention_author=False,
+                        ephemeral=True,
                     )
 
                 ok = await self.dispatch_approval_card(existing)
                 if ok:
-                    return await ctx.reply(
+                    return await interaction.followup.send(
                         "✅ Existing Canon Fiction XP claim found and approval card resent.",
-                        mention_author=False,
+                        ephemeral=True,
                     )
 
-                return await ctx.reply(
+                return await interaction.followup.send(
                     "A claim already exists, but I could not send the approval card. "
                     "Check `RP_XP_APPROVAL_CHANNEL_ID` in Railway.",
-                    mention_author=False,
+                    ephemeral=True,
                 )
 
             ins = (
                 self.sb()
                 .table("rp_xp_claims")
                 .insert({
-                    "guild_id": int(ctx.guild.id),
+                    "guild_id": int(interaction.guild.id),
                     "claim_type": "journal",
                     "scene_id": None,
                     "event_id": None,
-                    "journal_forum_id": int(ctx.channel.parent_id or 0) or CANON_FICTION_FORUM_ID or None,
-                    "journal_thread_id": int(ctx.channel.id),
-                    "journal_message_id": int(ctx.message.id),
+                    "journal_forum_id": int(interaction.channel.parent_id or 0) or CANON_FICTION_FORUM_ID or None,
+                    "journal_thread_id": int(interaction.channel.id),
+                    "journal_message_id": int(interaction.channel.id),
                     "character_id": oc_row["character_id"],
-                    "user_id": int(ctx.author.id),
+                    "user_id": int(interaction.user.id),
                     "character_name": oc_row["name"],
                     "word_count": int(words),
                     "post_count": int(posts),
@@ -848,12 +947,12 @@ class JournalTrackerCog(commands.Cog):
                     "approved_xp": None,
                     "status": "pending",
                     "locations": [{
-                        "title": str(ctx.channel.name or "Canon Fiction Post"),
-                        "thread_id": int(ctx.channel.id),
+                        "title": str(interaction.channel.name or "Canon Fiction Post"),
+                        "thread_id": int(interaction.channel.id),
                         "words": int(words),
                         "posts": int(posts),
                     }],
-                    "created_by": int(ctx.author.id),
+                    "created_by": int(interaction.user.id),
                 })
                 .execute()
             )
@@ -862,76 +961,50 @@ class JournalTrackerCog(commands.Cog):
             claim = rows[0] if rows else None
 
             if not claim:
-                return await ctx.reply(
+                return await interaction.followup.send(
                     "I could not create the Canon Fiction XP claim.",
-                    mention_author=False,
+                    ephemeral=True,
                 )
 
             sent = await self.dispatch_approval_card(claim)
 
             if sent:
-                return await ctx.reply(
+                return await interaction.followup.send(
                     f"✅ Canon Fiction XP submitted for **{oc_row['name']}**.\n"
                     f"Words: `{words}` / Posts counted: `{posts}` / Estimated XP: `{estimated_xp}`\n"
                     f"Sent to staff for approval.",
-                    mention_author=False,
+                    ephemeral=True,
                 )
 
-            return await ctx.reply(
+            return await interaction.followup.send(
                 f"⚠️ Claim saved, but I could not send the approval card.\n"
                 f"Words: `{words}` / Posts counted: `{posts}` / Estimated XP: `{estimated_xp}`\n"
                 "Check `RP_XP_APPROVAL_CHANNEL_ID` in Railway.",
-                mention_author=False,
+                ephemeral=True,
             )
 
         except Exception as e:
-            print(f"[journal_submit] error: {e}")
+            print(f"[journal submit] error: {e}")
             traceback.print_exc()
-            return await ctx.reply(
+            return await interaction.followup.send(
                 "Server error while submitting Canon Fiction XP.",
-                mention_author=False,
+                ephemeral=True,
             )
 
+    # Prefix fallbacks kept for emergencies while Discord slash command sync catches up.
     @commands.command(name="journal_count")
-    async def journal_count(self, ctx: commands.Context):
-        """Count the current Canon Fiction post without submitting it."""
+    async def journal_count_prefix(self, ctx: commands.Context, *, oc: str | None = None):
+        return await ctx.reply(
+            "Use `/journal count` now. If this is a Tupper post, pick your OC in the command option.",
+            mention_author=False,
+        )
 
-        if not isinstance(ctx.channel, discord.Thread):
-            return await ctx.reply(
-                "Use this inside a Canon Fiction forum post/thread.",
-                mention_author=False,
-            )
-
-        if CANON_FICTION_FORUM_ID and int(ctx.channel.parent_id or 0) != CANON_FICTION_FORUM_ID:
-            return await ctx.reply(
-                "This does not look like the configured Canon Fiction forum.",
-                mention_author=False,
-            )
-
-        try:
-            words, posts = await self.count_author_posts_in_thread(
-                thread=ctx.channel,
-                author_id=int(ctx.author.id),
-            )
-
-            estimated_xp = journal_xp_from_words(words)
-
-            return await ctx.reply(
-                f"Canon Fiction count for **{ctx.author.display_name}**:\n"
-                f"Words: `{words}`\n"
-                f"Posts counted: `{posts}`\n"
-                f"Estimated XP: `{estimated_xp}`\n"
-                f"Rate: `{JOURNAL_XP_WORDS_PER_CHUNK}` words = `{JOURNAL_XP_PER_CHUNK}` XP",
-                mention_author=False,
-            )
-
-        except Exception as e:
-            print(f"[journal_count] error: {e}")
-            traceback.print_exc()
-            return await ctx.reply(
-                "Server error while counting this Canon Fiction post.",
-                mention_author=False,
-            )
+    @commands.command(name="journal_submit")
+    async def journal_submit_prefix(self, ctx: commands.Context, *, oc: str):
+        return await ctx.reply(
+            "Use `/journal submit` now and pick your OC in the command option.",
+            mention_author=False,
+        )
 
     @commands.Cog.listener()
     async def on_interaction(self, interaction: discord.Interaction):
