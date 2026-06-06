@@ -45,6 +45,11 @@ def count_words(content: str) -> int:
     return len(WORD_RE.findall(content or ""))
 
 
+def normalize_message_content(content: str) -> str:
+    """Normalize message content so Tupper mirror/original duplicates can be detected."""
+    return re.sub(r"\s+", " ", (content or "").strip()).casefold()
+
+
 def journal_xp_from_words(words: int) -> int:
     chunks = words // JOURNAL_XP_WORDS_PER_CHUNK
     return chunks * JOURNAL_XP_PER_CHUNK
@@ -735,10 +740,22 @@ class JournalTrackerCog(
         Normal Discord posts are matched by the player's Discord ID.
         Tupper/webhook posts are matched by OC name, because their author is the
         webhook/bot rather than the player.
+
+        Tupperbox can briefly leave both the original user message and the
+        webhook copy visible, or the original can fail to delete. To prevent
+        double-counting, this de-duplicates messages with the same normalized
+        content when they appear within a short time window. This keeps repeated
+        paragraphs inside one message intact, but avoids counting the same
+        mirrored message twice.
         """
         words = 0
         posts = 0
         target_oc = normalize_oc_name(oc_name or "")
+
+        # content key -> last timestamp seen. Only treat as duplicate when the
+        # same content appears close together, which is how Tupper mirroring shows up.
+        seen_content_times: dict[str, float] = {}
+        duplicate_window_seconds = 180
 
         async for message in thread.history(limit=1000, oldest_first=True):
             if not is_valid_journal_message(message):
@@ -752,6 +769,16 @@ class JournalTrackerCog(
 
             if not is_user_message and not is_matching_tupper:
                 continue
+
+            content_key = normalize_message_content(message.content)
+            if content_key:
+                ts = message.created_at.timestamp()
+                last_ts = seen_content_times.get(content_key)
+
+                if last_ts is not None and abs(ts - last_ts) <= duplicate_window_seconds:
+                    continue
+
+                seen_content_times[content_key] = ts
 
             words += count_words(message.content)
             posts += 1
@@ -849,6 +876,104 @@ class JournalTrackerCog(
             traceback.print_exc()
             return await interaction.followup.send(
                 "Server error while counting this Canon Fiction post.",
+                ephemeral=True,
+            )
+
+    @app_commands.command(name="rescan", description="Re-count this Canon Fiction post and update its pending XP claim")
+    @app_commands.describe(oc="Your registered OC for this Canon Fiction post")
+    @app_commands.autocomplete(oc=oc_name_autocomplete)
+    async def journal_rescan(self, interaction: discord.Interaction, oc: str):
+        await interaction.response.defer(ephemeral=True)
+
+        if not isinstance(interaction.channel, discord.Thread):
+            return await interaction.followup.send(
+                "Use this inside the Canon Fiction forum post/thread you want to rescan.",
+                ephemeral=True,
+            )
+
+        if not interaction.guild:
+            return await interaction.followup.send(
+                "Use this in the server, not DMs.",
+                ephemeral=True,
+            )
+
+        if not self.is_canon_fiction_thread(interaction.channel):
+            return await interaction.followup.send(
+                "This does not look like the configured Canon Fiction forum.",
+                ephemeral=True,
+            )
+
+        try:
+            oc_row = await self.get_owned_oc_by_name(int(interaction.user.id), oc)
+            if not oc_row:
+                return await interaction.followup.send(
+                    "OC not found, or that OC is not yours. Make sure the OC is registered with Keystone.",
+                    ephemeral=True,
+                )
+
+            existing = await self.find_existing_journal_claim(
+                guild_id=int(interaction.guild.id),
+                journal_thread_id=int(interaction.channel.id),
+                character_id=oc_row["character_id"],
+            )
+
+            if not existing:
+                return await interaction.followup.send(
+                    f"No Canon Fiction XP claim exists for **{oc_row['name']}** in this post yet. "
+                    "Use `/journal submit` first.",
+                    ephemeral=True,
+                )
+
+            if existing.get("status") != "pending":
+                return await interaction.followup.send(
+                    f"This claim is already **{existing.get('status')}**, so I will not rescan it. "
+                    "Staff can adjust the XP manually from the approval card if needed.",
+                    ephemeral=True,
+                )
+
+            words, posts = await self.count_author_posts_in_thread(
+                thread=interaction.channel,
+                author_id=int(interaction.user.id),
+                oc_name=oc_row["name"],
+            )
+            estimated_xp = journal_xp_from_words(words)
+
+            upd = (
+                self.sb()
+                .table("rp_xp_claims")
+                .update({
+                    "word_count": int(words),
+                    "post_count": int(posts),
+                    "estimated_xp": int(estimated_xp),
+                    "locations": [{
+                        "title": str(interaction.channel.name or "Canon Fiction Post"),
+                        "thread_id": int(interaction.channel.id),
+                        "words": int(words),
+                        "posts": int(posts),
+                    }],
+                })
+                .eq("claim_id", existing["claim_id"])
+                .execute()
+            )
+
+            rows = getattr(upd, "data", None) or []
+            updated = rows[0] if rows else await self.fetch_claim(existing["claim_id"])
+
+            if updated and updated.get("approval_message_id"):
+                await self.refresh_claim_message(updated)
+
+            return await interaction.followup.send(
+                f"✅ Canon Fiction claim rescanned for **{oc_row['name']}**.\n"
+                f"Words: `{words}` / Posts counted: `{posts}` / Estimated XP: `{estimated_xp}`\n"
+                "If an approval card already exists, I updated it too.",
+                ephemeral=True,
+            )
+
+        except Exception as e:
+            print(f"[journal rescan] error: {e}")
+            traceback.print_exc()
+            return await interaction.followup.send(
+                "Server error while rescanning this Canon Fiction post.",
                 ephemeral=True,
             )
 
@@ -1003,6 +1128,13 @@ class JournalTrackerCog(
     async def journal_submit_prefix(self, ctx: commands.Context, *, oc: str):
         return await ctx.reply(
             "Use `/journal submit` now and pick your OC in the command option.",
+            mention_author=False,
+        )
+
+    @commands.command(name="journal_rescan")
+    async def journal_rescan_prefix(self, ctx: commands.Context, *, oc: str):
+        return await ctx.reply(
+            "Use `/journal rescan` now and pick your OC in the command option.",
             mention_author=False,
         )
 
