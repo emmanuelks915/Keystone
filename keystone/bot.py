@@ -115,6 +115,7 @@ KEYSTONE_EXTENSIONS = [
     "cogs.giveaway",
     "cogs.help",
     "cogs.signal_bell",
+    "cogs.journal_tracker",
 
 
 ]
